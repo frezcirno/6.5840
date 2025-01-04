@@ -9,6 +9,8 @@ import (
 
 type Clerk struct {
 	server *labrpc.ClientEnd
+	me     int32
+	seq    int32
 }
 
 func nrand() int64 {
@@ -21,6 +23,8 @@ func nrand() int64 {
 func MakeClerk(server *labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.server = server
+	ck.me = int32(nrand())
+	ck.seq = 0
 	return ck
 }
 
@@ -45,9 +49,9 @@ func (ck *Clerk) Call(method string, args interface{}, reply interface{}) {
 func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
 	reply := GetReply{}
-	txn := nrand()
-	ck.Call("KVServer.Get", &GetArgs{Key: key, Txn: txn}, &reply)
-	ck.Call("KVServer.Ack", &AckArgs{Txn: txn}, &AckReply{})
+	seq := ck.seq
+	ck.seq++
+	ck.Call("KVServer.Get", &GetArgs{Key: key, ClientId: ck.me, Seq: seq}, &reply)
 	return reply.Value
 }
 
@@ -62,9 +66,9 @@ func (ck *Clerk) Get(key string) string {
 func (ck *Clerk) PutAppend(key string, value string, op string) string {
 	// You will have to modify this function.
 	reply := PutAppendReply{}
-	txn := nrand()
-	ck.Call("KVServer."+op, &PutAppendArgs{Key: key, Value: value, Txn: txn}, &reply)
-	ck.Call("KVServer.Ack", &AckArgs{Txn: txn}, &AckReply{})
+	seq := ck.seq
+	ck.seq++
+	ck.Call("KVServer."+op, &PutAppendArgs{Key: key, Value: value, ClientId: ck.me, Seq: seq}, &reply)
 	return reply.Value
 }
 

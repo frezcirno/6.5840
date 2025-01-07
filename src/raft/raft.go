@@ -20,7 +20,6 @@ package raft
 import (
 	//	"bytes"
 	"bytes"
-	"log"
 	"math/rand"
 	"strconv"
 	"sync"
@@ -185,12 +184,11 @@ type Raft struct {
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	leader          bool
-	electionTimer   *time.Timer
-	heartbeatTimer  *time.Timer
-	applyCond       *sync.Cond
-	pendingSnapshot *ApplyMsg
-	replicateCond   []*sync.Cond
+	leader         bool
+	electionTimer  *time.Timer
+	heartbeatTimer *time.Timer
+	applyCond      *sync.Cond
+	replicateCond  []*sync.Cond
 
 	currentTerm int
 	votedFor    int
@@ -234,15 +232,9 @@ func (rf *Raft) nextLogIndex() int {
 	return rf.prevLogIndex() + len(rf.log)
 }
 
-func (rf *Raft) getLog(index int) *LogEntry {
-	assert_le(rf.firstLogIndex(), index, "index out of range")
-	assert_le(index, rf.nextLogIndex(), "index out of range")
-	return &rf.log[index-rf.prevLogIndex()]
-}
-
 // Get log entries from [from:], from is the global log index
 func (rf *Raft) getLogFrom(from int) []LogEntry {
-	assert_le(rf.firstLogIndex(), from, "index out of range")
+	// assert_le(rf.firstLogIndex(), from, "index out of range")
 	if from >= rf.nextLogIndex() {
 		return []LogEntry{}
 	}
@@ -250,22 +242,22 @@ func (rf *Raft) getLogFrom(from int) []LogEntry {
 }
 
 func (rf *Raft) getLogSlice(from int, to int) []LogEntry {
-	assert_le(rf.firstLogIndex(), from, "index out of range")
-	assert_le(to, rf.nextLogIndex(), "index out of range")
+	// assert_le(rf.firstLogIndex(), from, "index out of range")
+	// assert_le(to, rf.nextLogIndex(), "index out of range")
 	return rf.log[from-rf.prevLogIndex() : to-rf.prevLogIndex()]
 }
 
 func (rf *Raft) getLogIndex(index int) int {
 	// local log index -> global log index
-	assert_le(1, index, "index out of range")
-	assert_le(index, len(rf.log), "index out of range")
+	// assert_le(1, index, "index out of range")
+	// assert_le(index, len(rf.log), "index out of range")
 	return rf.prevLogIndex() + index
 }
 
 func (rf *Raft) getLogTerm(index int) int {
 	// Note: allow get term of dummy log entry
-	assert_le(rf.prevLogIndex(), index, "index out of range")
-	assert_le(index, rf.lastLogIndex(), "index out of range")
+	// assert_le(rf.prevLogIndex(), index, "index out of range")
+	// assert_le(index, rf.lastLogIndex(), "index out of range")
 	return rf.log[index-rf.prevLogIndex()].Term
 }
 
@@ -378,17 +370,17 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.beFollower(args.Term)
 	}
 
-	assert_eq(args.Term, rf.currentTerm, "term mismatch")
-	assert(!rf.leader, "leader should not receive InstallSnapshot")
+	// assert_eq(args.Term, rf.currentTerm, "term mismatch")
+	// assert(!rf.leader, "leader should not receive InstallSnapshot")
 	rf.electionTimer.Reset(makeElectionTimeout())
-	log.Println("Raft", rf.me, "[install] from leader term", args.Term, "with logs[:", args.LastIncludedIndex+1, "]", "my logs[", rf.firstLogIndex(), ":", rf.nextLogIndex(), "]", "commitIndex", rf.commitIndex, "lastApplied", rf.lastApplied)
+	// log.Println("Raft", rf.me, "[install] from leader term", args.Term, "with logs[:", args.LastIncludedIndex+1, "]", "my logs[", rf.firstLogIndex(), ":", rf.nextLogIndex(), "]", "commitIndex", rf.commitIndex, "lastApplied", rf.lastApplied)
 	reply.Term = rf.currentTerm
 
 	// outdated snapshot
 	if args.LastIncludedIndex <= rf.commitIndex {
 		return
 	}
-	assert(args.LastIncludedIndex > rf.commitIndex, "snapshot index <= commitIndex")
+	// assert(args.LastIncludedIndex > rf.commitIndex, "snapshot index <= commitIndex")
 
 	// truncate logs
 	dummy := []LogEntry{{Term: args.LastIncludedTerm, Command: args.LastIncludedIndex}}
@@ -397,26 +389,19 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	// update commitIndex
 	rf.commitIndex = args.LastIncludedIndex
 	rf.lastApplied = args.LastIncludedIndex
-	assert_le(rf.commitIndex, rf.lastLogIndex(), "commitIndex > lastLogIndex")
-	assert_ge(rf.lastApplied, rf.prevLogIndex(), "lastApplied < prevLogIndex")
+	// assert_le(rf.commitIndex, rf.lastLogIndex(), "commitIndex > lastLogIndex")
+	// assert_ge(rf.lastApplied, rf.prevLogIndex(), "lastApplied < prevLogIndex")
 
 	rf.persistWithSnapshot(args.Data)
 	// apply snapshot
-	// go func() {
-	// 	rf.applyCh <- ApplyMsg{
-	// 		SnapshotValid: true,
-	// 		Snapshot:      args.Data,
-	// 		SnapshotTerm:  args.LastIncludedTerm,
-	// 		SnapshotIndex: args.LastIncludedIndex,
-	// 	}
-	// }()
-	rf.pendingSnapshot = &ApplyMsg{
-		SnapshotValid: true,
-		Snapshot:      args.Data,
-		SnapshotTerm:  args.LastIncludedTerm,
-		SnapshotIndex: args.LastIncludedIndex,
-	}
-	rf.applyCond.Signal()
+	go func() {
+		rf.applyCh <- ApplyMsg{
+			SnapshotValid: true,
+			Snapshot:      args.Data,
+			SnapshotTerm:  args.LastIncludedTerm,
+			SnapshotIndex: args.LastIncludedIndex,
+		}
+	}()
 }
 
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
@@ -438,12 +423,12 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		return
 	}
 
-	log.Println("Raft", rf.me, "[snapshot] log[", rf.firstLogIndex(), ":", index+1, "]")
+	// log.Println("Raft", rf.me, "[snapshot] log[", rf.firstLogIndex(), ":", index+1, "]")
 	// truncate logs
 	rf.log = rf.getLogFrom(index)
 	rf.log[0].Command = index
-	assert_le(rf.commitIndex, rf.lastLogIndex(), "commitIndex > lastLogIndex")
-	assert_ge(rf.lastApplied, rf.prevLogIndex(), "lastApplied < prevLogIndex")
+	// assert_le(rf.commitIndex, rf.lastLogIndex(), "commitIndex > lastLogIndex")
+	// assert_ge(rf.lastApplied, rf.prevLogIndex(), "lastApplied < prevLogIndex")
 
 	rf.persistWithSnapshot(snapshot)
 }
@@ -498,7 +483,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.beFollower(args.Term)
 	}
 
-	assert_eq(args.Term, rf.currentTerm, "term mismatch")
+	// assert_eq(args.Term, rf.currentTerm, "term mismatch")
 	reply.Term = rf.currentTerm
 
 	// check if we can vote for the candidate
@@ -511,7 +496,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else {
 		reply.VoteGranted = false
 	}
-	log.Println("Raft", rf.me, "[vote]", args.CandidateId, "in term", rf.currentTerm, ":", reply.VoteGranted)
+	// log.Println("Raft", rf.me, "[vote]", args.CandidateId, "in term", rf.currentTerm, ":", reply.VoteGranted)
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -578,10 +563,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.beFollower(args.Term)
 	}
 
-	assert_eq(args.Term, rf.currentTerm, "term mismatch")
-	assert(!rf.leader, "leader should not receive AppendEntries")
+	// assert_eq(args.Term, rf.currentTerm, "term mismatch")
+	// assert(!rf.leader, "leader should not receive AppendEntries")
 	rf.electionTimer.Reset(makeElectionTimeout())
-	log.Println("Raft", rf.me, "[ping] from leader term", rf.currentTerm, "with log[", args.PrevLogIndex+1, ":", args.PrevLogIndex+1+len(args.Entries), "]")
+	// log.Println("Raft", rf.me, "[ping] from leader term", rf.currentTerm, "with log[", args.PrevLogIndex+1, ":", args.PrevLogIndex+1+len(args.Entries), "]")
 	reply.Term = rf.currentTerm
 
 	// conflict because we don't have the prev log entry
@@ -612,7 +597,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	assert_le(args.PrevLogIndex, rf.lastLogIndex(), "args.PrevLogIndex > rf.lastLogIndex")
+	// assert_le(args.PrevLogIndex, rf.lastLogIndex(), "args.PrevLogIndex > rf.lastLogIndex")
 
 	// conflict because log entry's term doesn't match
 	// ===============[x....we have....]
@@ -631,7 +616,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	assert_eq(args.PrevLogTerm, rf.getLogTerm(args.PrevLogIndex), "term mismatch")
+	// assert_eq(args.PrevLogTerm, rf.getLogTerm(args.PrevLogIndex), "term mismatch")
 	reply.Success = true
 
 	// Overwrite unmatched log entries
@@ -656,7 +641,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.commitIndex = newCommitIndex
 		rf.applyCond.Signal()
 	}
-	assert_le(rf.commitIndex, rf.lastLogIndex(), "commitIndex > lastLogIndex")
+	// assert_le(rf.commitIndex, rf.lastLogIndex(), "commitIndex > lastLogIndex")
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -688,10 +673,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term:    rf.currentTerm,
 		Command: command,
 	})
-	assert_le(rf.commitIndex, rf.lastLogIndex(), "commitIndex > lastLogIndex")
-	assert_ge(rf.lastApplied, rf.prevLogIndex(), "lastApplied < prevLogIndex")
+	// assert_le(rf.commitIndex, rf.lastLogIndex(), "commitIndex > lastLogIndex")
+	// assert_ge(rf.lastApplied, rf.prevLogIndex(), "lastApplied < prevLogIndex")
 	rf.persist()
-	log.Println("Raft", rf.me, "[start]", rf.lastLogIndex())
+	// log.Println("Raft", rf.me, "[start]", rf.lastLogIndex())
 	rf.doReplicate(false)
 	return rf.lastLogIndex(), rf.currentTerm, true
 }
@@ -721,7 +706,7 @@ func (rf *Raft) doElection() {
 	{
 		rf.mu.Lock()
 
-		log.Println("Raft", rf.me, "[election] for term", rf.currentTerm+1)
+		// log.Println("Raft", rf.me, "[election] for term", rf.currentTerm+1)
 		rf.currentTerm++
 		rf.votedFor = rf.me
 		rf.persist()
@@ -750,7 +735,7 @@ func (rf *Raft) doElection() {
 			}
 
 			if reply.VoteGranted {
-				log.Println("Raft", rf.me, "[received] vote from", i)
+				// log.Println("Raft", rf.me, "[received] vote from", i)
 				votes := int(votes.Add(1))
 
 				rf.mu.Lock()
@@ -760,7 +745,7 @@ func (rf *Raft) doElection() {
 				if votes > len(rf.peers)/2 &&
 					rf.currentTerm == args.Term && !rf.leader {
 					// we are the leader
-					log.Println("Raft", rf.me, "[leader] for term", rf.currentTerm)
+					// log.Println("Raft", rf.me, "[leader] for term", rf.currentTerm)
 					rf.switchLeader(true)
 					rf.doReplicate(true)
 				}
@@ -848,9 +833,9 @@ func (rf *Raft) updateCommitIndex() {
 		// committed indirectly because of the Log Matching Property.
 		if rf.getLogTerm(newCommitIndex) == rf.currentTerm {
 			rf.commitIndex = newCommitIndex
-			assert_gt(rf.commitIndex, rf.lastApplied, "commitIndex <= lastApplied")
-			assert_le(rf.commitIndex, rf.lastLogIndex(), "commitIndex > lastLogIndex")
-			log.Println("Raft", rf.me, "[update] commit index to", newCommitIndex, "lastApplied", rf.lastApplied)
+			// assert_gt(rf.commitIndex, rf.lastApplied, "commitIndex <= lastApplied")
+			// assert_le(rf.commitIndex, rf.lastLogIndex(), "commitIndex > lastLogIndex")
+			// log.Println("Raft", rf.me, "[update] commit index to", newCommitIndex, "lastApplied", rf.lastApplied)
 			rf.applyCond.Signal()
 		}
 	}
@@ -877,7 +862,7 @@ func (rf *Raft) replicateByAE(i int, args *AppendEntriesArgs, nextIndex int) {
 		rf.updateCommitIndex()
 	} else {
 		// Reject because of outdateness
-		log.Println("Raft", rf.me, "[replicateAE rejected] by", i, "because", reply)
+		// log.Println("Raft", rf.me, "[replicateAE rejected] by", i, "because", reply)
 
 		// we are outdated
 		if reply.Term > rf.currentTerm {
@@ -916,8 +901,8 @@ func (rf *Raft) replicateTo(i int) {
 
 	nextIndex := rf.nextIndex[i]
 	if nextIndex < rf.firstLogIndex() {
-		assert_gt(len(rf.persister.ReadSnapshot()), 0, "snapshot is empty")
-		log.Println("Raft", rf.me, "[replicateIS] to", i, "nextIndex", nextIndex)
+		// assert_gt(len(rf.persister.ReadSnapshot()), 0, "snapshot is empty")
+		// log.Println("Raft", rf.me, "[replicateIS] to", i, "nextIndex", nextIndex)
 		args := &InstallSnapshotArgs{
 			Term:              rf.currentTerm,
 			LeaderId:          rf.me,
@@ -928,8 +913,8 @@ func (rf *Raft) replicateTo(i int) {
 		rf.mu.RUnlock()
 		rf.replicateByIS(i, args)
 	} else {
-		log.Println("Raft", rf.me, "[replicateAE] to", i, "nextIndex", nextIndex)
-		assert_le(rf.commitIndex, rf.lastLogIndex(), "commitIndex > lastLogIndex")
+		// log.Println("Raft", rf.me, "[replicateAE] to", i, "nextIndex", nextIndex)
+		// assert_le(rf.commitIndex, rf.lastLogIndex(), "commitIndex > lastLogIndex")
 		args := &AppendEntriesArgs{
 			Term:         rf.currentTerm,
 			LeaderId:     rf.me,
@@ -960,24 +945,16 @@ func (rf *Raft) replicator(i int) {
 func (rf *Raft) applier() {
 	for !rf.killed() {
 		rf.mu.Lock()
-		for rf.commitIndex <= rf.lastApplied && rf.pendingSnapshot == nil {
+		for rf.commitIndex <= rf.lastApplied {
 			rf.applyCond.Wait()
 		}
 
-		if rf.pendingSnapshot != nil {
-			rf.mu.Unlock()
-			rf.applyCh <- *rf.pendingSnapshot
-			rf.pendingSnapshot = nil
-			log.Println("Raft", rf.me, "[apply] snapshot")
-			continue
-		}
-
-		assert_gt(rf.commitIndex, rf.lastApplied, "commitIndex <= lastApplied")
-		assert_le(rf.commitIndex, rf.lastLogIndex(), "commitIndex > lastLogIndex")
-		assert_ge(rf.lastApplied, rf.prevLogIndex(), "lastApplied < prevLogIndex")
+		// assert_gt(rf.commitIndex, rf.lastApplied, "commitIndex <= lastApplied")
+		// assert_le(rf.commitIndex, rf.lastLogIndex(), "commitIndex > lastLogIndex")
+		// assert_ge(rf.lastApplied, rf.prevLogIndex(), "lastApplied < prevLogIndex")
 
 		startIndex := rf.lastApplied + 1
-		log.Println("Raft", rf.me, "[apply] log[", startIndex, ":", rf.commitIndex+1, "]")
+		// log.Println("Raft", rf.me, "[apply] log[", startIndex, ":", rf.commitIndex+1, "]")
 		entries := append([]LogEntry{}, rf.getLogSlice(startIndex, rf.commitIndex+1)...)
 		rf.lastApplied = rf.commitIndex
 		rf.mu.Unlock()
@@ -990,9 +967,6 @@ func (rf *Raft) applier() {
 				CommandIndex: startIndex + i,
 			}
 		}
-		// rf.mu.Lock()
-		// rf.lastApplied = max(rf.lastApplied, rf.commitIndex)
-		// rf.mu.Unlock()
 	}
 }
 
@@ -1016,7 +990,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (3A, 3B, 3C).
 	rf.leader = false
 	rf.applyCond = sync.NewCond(&rf.mu)
-	rf.pendingSnapshot = nil
 	rf.replicateCond = make([]*sync.Cond, len(peers))
 	rf.electionTimer = time.NewTimer(makeElectionTimeout())
 	rf.heartbeatTimer = time.NewTimer(HeartbeatIntervalMs * time.Millisecond)
@@ -1037,7 +1010,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-	log.Println("Raft", rf.me, "[init] with logs[", rf.firstLogIndex(), ":", rf.nextLogIndex(), "], leader", rf.leader, "commitIndex", rf.commitIndex, "lastApplied", rf.lastApplied)
+	// log.Println("Raft", rf.me, "[init] with logs[", rf.firstLogIndex(), ":", rf.nextLogIndex(), "], leader", rf.leader, "commitIndex", rf.commitIndex, "lastApplied", rf.lastApplied)
 
 	for i := range rf.peers {
 		if i == rf.me {

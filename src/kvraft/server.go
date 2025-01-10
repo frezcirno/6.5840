@@ -23,10 +23,8 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 }
 
 func assert(cond bool, msg string) {
-	if Debug {
-		if !cond {
-			log.Panicln(msg)
-		}
+	if !cond {
+		log.Panicln(msg)
 	}
 }
 
@@ -34,11 +32,11 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Key      string
-	Value    string
-	Op       string
 	ClientId int64
 	Seq      int64
+	Op       string
+	Key      string
+	Value    string
 }
 
 type Result struct {
@@ -62,7 +60,7 @@ type KVServer struct {
 
 	// Your definitions here.
 	store  map[string]string
-	last   map[int64]Last
+	last   map[int64]*Last
 	notify map[int]chan *Result
 }
 
@@ -263,7 +261,7 @@ func (kv *KVServer) applier() {
 			op := msg.Command.(Op)
 			if !kv.isDup(op.ClientId, op.Seq) {
 				result := kv.execute(op)
-				kv.last[op.ClientId] = Last{Seq: op.Seq, Result: result}
+				kv.last[op.ClientId] = &Last{Seq: op.Seq, Result: result}
 			}
 
 			// only notify related channel for currentTerm's log when node is leader
@@ -308,7 +306,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	kv.store = make(map[string]string)
-	kv.last = make(map[int64]Last)
+	kv.last = make(map[int64]*Last)
 	kv.notify = make(map[int]chan *Result)
 
 	kv.applyCh = make(chan raft.ApplyMsg)

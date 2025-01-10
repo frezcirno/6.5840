@@ -22,7 +22,7 @@ type ShardCtrler struct {
 
 	// Your data here.
 	dead   int32 // set by Kill()
-	last   map[int64]Last
+	last   map[int64]*Last
 	notify map[int]chan *Result
 
 	configs []Config // indexed by config num
@@ -465,7 +465,7 @@ func (sc *ShardCtrler) applier() {
 			op := msg.Command.(Op)
 			if !sc.isDup(op.ClientId, op.Seq) {
 				result := sc.execute(&op)
-				sc.last[op.ClientId] = Last{Seq: op.Seq, Result: result}
+				sc.last[op.ClientId] = &Last{Seq: op.Seq, Result: result}
 			}
 
 			// only notify related channel for currentTerm's log when node is leader
@@ -496,7 +496,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sc.rf = raft.Make(servers, me, persister, sc.applyCh)
 
 	// Your code here.
-	sc.last = make(map[int64]Last)
+	sc.last = make(map[int64]*Last)
 	sc.notify = make(map[int]chan *Result)
 	// sc.restoreSnapshot(persister.ReadSnapshot())
 	go sc.applier()

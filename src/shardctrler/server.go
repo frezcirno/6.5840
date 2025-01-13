@@ -77,187 +77,92 @@ func (sc *ShardCtrler) getNotify(logIndex int) chan *Result {
 	return sc.notify[logIndex]
 }
 
-// Create a new replica group
-func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
-	// Your code here.
+func (sc *ShardCtrler) purpose(op *Op) (res interface{}, err Err) {
+	// log.Printf("ShardCtrler-%d [PURPOSE] %v\n", sc.me, *op)
 
 	sc.mu.RLock()
-	if sc.isDup(args.ClientId, args.Seq) {
-		lastResult := sc.last[args.ClientId].Result
-		reply.Err = lastResult.Err
-		sc.mu.RUnlock()
-		return
+	if sc.isDup(op.ClientId, op.Seq) {
+		lastResult := sc.last[op.ClientId].Result
+		defer sc.mu.RUnlock()
+		return lastResult.Value, lastResult.Err
 	}
 	sc.mu.RUnlock()
 
-	logIndex, _, leader := sc.rf.Start(Op{
+	logIndex, _, leader := sc.rf.Start(*op)
+	if !leader {
+		return "", ErrWrongLeader
+	}
+
+	sc.mu.Lock()
+	notify := sc.getNotify(logIndex)
+	sc.mu.Unlock()
+
+	// wait for the result
+	select {
+	case r := <-notify:
+		res, err = r.Value, r.Err
+	case <-time.After(ExecuteTimeout):
+		// timeout, ask client to poll again later
+		err = ErrTimeout
+	}
+
+	// clean up
+	go func() {
+		sc.mu.Lock()
+		delete(sc.notify, logIndex)
+		sc.mu.Unlock()
+	}()
+
+	return
+}
+
+// Add new groups
+func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
+	// Your code here.
+	_, reply.Err = sc.purpose(&Op{
 		ClientId: args.ClientId,
 		Seq:      args.Seq,
 		Op:       "Join",
 		Replicas: args.Servers,
 	})
-	if !leader {
-		reply.WrongLeader = true
-		return
-	}
-	reply.WrongLeader = false
-
-	sc.mu.Lock()
-	notify := sc.getNotify(logIndex)
-	sc.mu.Unlock()
-
-	// wait for the result
-	select {
-	case r := <-notify:
-		reply.Err = r.Err
-	case <-time.After(ExecuteTimeout):
-		// timeout, ask client to poll again later
-		reply.Err = ErrTimeout
-	}
-
-	// clean up
-	go func() {
-		sc.mu.Lock()
-		delete(sc.notify, logIndex)
-		sc.mu.Unlock()
-	}()
 }
 
+// Destroy groups
 func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 	// Your code here.
-
-	sc.mu.RLock()
-	if sc.isDup(args.ClientId, args.Seq) {
-		lastResult := sc.last[args.ClientId].Result
-		reply.Err = lastResult.Err
-		sc.mu.RUnlock()
-		return
-	}
-	sc.mu.RUnlock()
-
-	logIndex, _, leader := sc.rf.Start(Op{
+	_, reply.Err = sc.purpose(&Op{
 		ClientId: args.ClientId,
 		Seq:      args.Seq,
 		Op:       "Leave",
 		GIDs:     args.GIDs,
 	})
-	if !leader {
-		reply.WrongLeader = true
-		return
-	}
-	reply.WrongLeader = false
-
-	sc.mu.Lock()
-	notify := sc.getNotify(logIndex)
-	sc.mu.Unlock()
-
-	// wait for the result
-	select {
-	case r := <-notify:
-		reply.Err = r.Err
-	case <-time.After(ExecuteTimeout):
-		// timeout, ask client to poll again later
-		reply.Err = ErrTimeout
-	}
-
-	// clean up
-	go func() {
-		sc.mu.Lock()
-		delete(sc.notify, logIndex)
-		sc.mu.Unlock()
-	}()
 }
 
+// Move shards from one group to another
 func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 	// Your code here.
-
-	sc.mu.RLock()
-	if sc.isDup(args.ClientId, args.Seq) {
-		lastResult := sc.last[args.ClientId].Result
-		reply.Err = lastResult.Err
-		sc.mu.RUnlock()
-		return
-	}
-	sc.mu.RUnlock()
-
-	logIndex, _, leader := sc.rf.Start(Op{
+	_, reply.Err = sc.purpose(&Op{
 		ClientId: args.ClientId,
 		Seq:      args.Seq,
 		Op:       "Move",
 		Shard:    args.Shard,
 		GID:      args.GID,
 	})
-	if !leader {
-		reply.WrongLeader = true
-		return
-	}
-	reply.WrongLeader = false
-
-	sc.mu.Lock()
-	notify := sc.getNotify(logIndex)
-	sc.mu.Unlock()
-
-	// wait for the result
-	select {
-	case r := <-notify:
-		reply.Err = r.Err
-	case <-time.After(ExecuteTimeout):
-		// timeout, ask client to poll again later
-		reply.Err = ErrTimeout
-	}
-
-	// clean up
-	go func() {
-		sc.mu.Lock()
-		delete(sc.notify, logIndex)
-		sc.mu.Unlock()
-	}()
 }
 
+// Query the configuration
 func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	// Your code here.
-
-	sc.mu.RLock()
-	if sc.isDup(args.ClientId, args.Seq) {
-		lastResult := sc.last[args.ClientId].Result
-		reply.Err = lastResult.Err
-		sc.mu.RUnlock()
-		return
-	}
-	sc.mu.RUnlock()
-
-	logIndex, _, leader := sc.rf.Start(Op{
+	res, err := sc.purpose(&Op{
 		ClientId: args.ClientId,
 		Seq:      args.Seq,
 		Op:       "Query",
 		Num:      args.Num,
 	})
-	if !leader {
-		reply.WrongLeader = true
-		return
+	reply.Err = err
+	if err == OK {
+		reply.Config = res.(Config)
 	}
-	reply.WrongLeader = false
-
-	sc.mu.Lock()
-	notify := sc.getNotify(logIndex)
-	sc.mu.Unlock()
-
-	// wait for the result
-	select {
-	case r := <-notify:
-		reply.Err = r.Err
-		reply.Config = r.Value.(Config)
-	case <-time.After(ExecuteTimeout):
-		// timeout, ask client to poll again later
-		reply.Err = ErrTimeout
-	}
-
-	// clean up
-	go func() {
-		sc.mu.Lock()
-		delete(sc.notify, logIndex)
-		sc.mu.Unlock()
-	}()
 }
 
 // the tester calls Kill() when a ShardCtrler instance won't
@@ -352,13 +257,10 @@ func (sc *ShardCtrler) execute(op *Op) *Result {
 			Groups: deepCopy(last.Groups),
 		}
 
-		// Insert new GID -> servers mappings
+		// Add new Groups
 		for gid, servers := range op.Replicas {
-			// Skip if GID already exists
-			// if _, ok := newConfig.Groups[gid]; ok {
-			// 	continue
-			// }
-
+			_, ok := newConfig.Groups[gid]
+			assert(!ok, "GID already exists")
 			newConfig.Groups[gid] = servers
 		}
 
@@ -392,14 +294,12 @@ func (sc *ShardCtrler) execute(op *Op) *Result {
 			Groups: deepCopy(last.Groups),
 		}
 
-		// Remove GID -> servers mappings
+		// Destroy Groups
 		g2s := group2Shards(newConfig)
 		orphanedShards := make([]int, 0)
 		for _, gid := range op.GIDs {
-			// Skip if GID does not exist
-			// if _, ok := newConfig.Groups[gid]; !ok {
-			// 	continue
-			// }
+			_, ok := newConfig.Groups[gid]
+			assert(ok, "GID does not exist")
 
 			delete(newConfig.Groups, gid)
 
@@ -498,7 +398,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	// Your code here.
 	sc.last = make(map[int64]*Last)
 	sc.notify = make(map[int]chan *Result)
-	// sc.restoreSnapshot(persister.ReadSnapshot())
 	go sc.applier()
 
 	return sc

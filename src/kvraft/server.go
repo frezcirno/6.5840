@@ -80,110 +80,74 @@ func (kv *KVServer) getNotify(logIndex int) chan *Result {
 	return kv.notify[logIndex]
 }
 
-func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// log.Println("KV", kv.me, "Get", args.ClientId, args.Seq)
-
+func (kv *KVServer) purpose(op *Op) (value string, err Err) {
 	kv.mu.RLock()
-	if kv.isDup(args.ClientId, args.Seq) {
-		lastResult := kv.last[args.ClientId].Result
-		reply.Value = lastResult.Value
-		reply.Err = lastResult.Err
+	if kv.isDup(op.ClientId, op.Seq) {
+		lastResult := kv.last[op.ClientId].Result
+		value = lastResult.Value
+		err = lastResult.Err
 		kv.mu.RUnlock()
-		// log.Println("KV", kv.me, "Get", args.ClientId, args.Seq, "is duplicated")
 		return
 	}
 	kv.mu.RUnlock()
 
-	logIndex, _, leader := kv.rf.Start(Op{
+	logIndex, _, leader := kv.rf.Start(*op)
+	if !leader {
+		err = ErrWrongLeader
+		return
+	}
+
+	kv.mu.Lock()
+	notify := kv.getNotify(logIndex)
+	kv.mu.Unlock()
+
+	// wait for the result
+	select {
+	case r := <-notify:
+		value = r.Value
+		err = r.Err
+	case <-time.After(ExecuteTimeout):
+		// timeout, ask client to poll again later
+		err = ErrTimeout
+	}
+
+	// clean up
+	go func() {
+		kv.mu.Lock()
+		delete(kv.notify, logIndex)
+		kv.mu.Unlock()
+	}()
+
+	return
+}
+
+func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
+	reply.Value, reply.Err = kv.purpose(&Op{
 		Key:      args.Key,
 		Op:       "Get",
 		ClientId: args.ClientId,
 		Seq:      args.Seq,
 	})
-	if !leader {
-		reply.Err = ErrWrongLeader
-		// log.Println("KV", kv.me, "Get", args.ClientId, args.Seq, "fails: not leader")
-		return
-	}
-
-	kv.mu.Lock()
-	notify := kv.getNotify(logIndex)
-	kv.mu.Unlock()
-
-	// wait for the result
-	select {
-	case r := <-notify:
-		reply.Value = r.Value
-		reply.Err = r.Err
-	case <-time.After(ExecuteTimeout):
-		// timeout, ask client to poll again later
-		reply.Err = ErrTimeout
-	}
-
-	// clean up
-	go func() {
-		kv.mu.Lock()
-		delete(kv.notify, logIndex)
-		kv.mu.Unlock()
-	}()
-
-	// log.Println("KV", kv.me, "Get", args.ClientId, args.Seq, "finished", reply.Err)
-}
-
-func (kv *KVServer) putAppend(op string, args *PutAppendArgs, reply *PutAppendReply) {
-	// log.Println("KV", kv.me, op, args.ClientId, args.Seq)
-
-	kv.mu.RLock()
-	if kv.isDup(args.ClientId, args.Seq) {
-		lastResult := kv.last[args.ClientId].Result
-		reply.Err = lastResult.Err
-		kv.mu.RUnlock()
-		// log.Println("KV", kv.me, op, args.ClientId, args.Seq, "is duplicated")
-		return
-	}
-	kv.mu.RUnlock()
-
-	logIndex, _, leader := kv.rf.Start(Op{
-		Key:      args.Key,
-		Value:    args.Value,
-		Op:       op,
-		ClientId: args.ClientId,
-		Seq:      args.Seq,
-	})
-	if !leader {
-		reply.Err = ErrWrongLeader
-		// log.Println("KV", kv.me, op, args.ClientId, args.Seq, "fails: not leader")
-		return
-	}
-
-	kv.mu.Lock()
-	notify := kv.getNotify(logIndex)
-	kv.mu.Unlock()
-
-	// wait for the result
-	select {
-	case r := <-notify:
-		reply.Err = r.Err
-	case <-time.After(ExecuteTimeout):
-		reply.Err = ErrTimeout
-	}
-
-	// clean up
-	go func() {
-		kv.mu.Lock()
-		delete(kv.notify, logIndex)
-		kv.mu.Unlock()
-	}()
-
-	// log.Println("KV", kv.me, op, args.ClientId, args.Seq, "finished", reply.Err)
 }
 
 func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
-	kv.putAppend("Put", args, reply)
+	_, reply.Err = kv.purpose(&Op{
+		Key:      args.Key,
+		Value:    args.Value,
+		Op:       "Put",
+		ClientId: args.ClientId,
+		Seq:      args.Seq,
+	})
 }
 
 func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
-	kv.putAppend("Append", args, reply)
+	_, reply.Err = kv.purpose(&Op{
+		Key:      args.Key,
+		Value:    args.Value,
+		Op:       "Append",
+		ClientId: args.ClientId,
+		Seq:      args.Seq,
+	})
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -252,12 +216,7 @@ func (kv *KVServer) applier() {
 		assert(msg.CommandValid || msg.SnapshotValid, "invalid message")
 		kv.mu.Lock()
 
-		if msg.SnapshotValid {
-			// log.Println("KV", kv.me, "Message", msg, "restoring", msg.SnapshotIndex)
-			kv.restoreSnapshot(msg.Snapshot)
-			// log.Println("KV", kv.me, "Message", msg, "restored")
-		} else {
-			// log.Println("KV", kv.me, "Message", msg)
+		if msg.CommandValid {
 			op := msg.Command.(Op)
 			if !kv.isDup(op.ClientId, op.Seq) {
 				result := kv.execute(op)
@@ -273,10 +232,10 @@ func (kv *KVServer) applier() {
 
 			// snapshot if log grows too big
 			if kv.maxraftstate != -1 && kv.rf.RaftStateSize() >= kv.maxraftstate {
-				// log.Println("KV", kv.me, "Message", msg, "snapshotting")
 				kv.rf.Snapshot(msg.CommandIndex, kv.makeSnapshot())
 			}
-			// log.Println("KV", kv.me, "Message", msg, "applied")
+		} else {
+			kv.restoreSnapshot(msg.Snapshot)
 		}
 
 		kv.mu.Unlock()

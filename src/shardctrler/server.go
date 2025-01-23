@@ -1,7 +1,6 @@
 package shardctrler
 
 import (
-	"log"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -21,17 +20,17 @@ type ShardCtrler struct {
 	applyCh chan raft.ApplyMsg
 
 	// Your data here.
-	dead   int32 // set by Kill()
-	last   map[int64]*Last
-	notify map[int]chan *Result
+	dead         int32 // set by Kill()
+	last         map[int64]*Last
+	notify       map[int]chan *Result
+	lastExecuted int
 
 	configs []Config // indexed by config num
 }
 
 type Result struct {
-	Err         Err
-	WrongLeader bool
-	Value       interface{}
+	Err   Err
+	Value interface{}
 }
 
 type Last struct {
@@ -39,11 +38,22 @@ type Last struct {
 	Result *Result
 }
 
+type OpType uint8
+
+const (
+	OpQuery OpType = iota
+	OpJoin
+	OpLeave
+	OpMove
+)
+
 type Op struct {
 	// Your data here.
 	ClientId int64
 	Seq      int64
-	Op       string
+	Op       OpType
+	// Query
+	Num int
 	// Join
 	Replicas map[int][]string
 	// Leave
@@ -51,13 +61,11 @@ type Op struct {
 	// Move
 	Shard int
 	GID   int
-	// Query
-	Num int
 }
 
 func assert(cond bool, msg string) {
 	if !cond {
-		log.Panicln(msg)
+		panic(msg)
 	}
 }
 
@@ -70,28 +78,20 @@ func (sc *ShardCtrler) isDup(clientId, seq int64) bool {
 	return seq == last.Seq
 }
 
-func (sc *ShardCtrler) getNotify(logIndex int) chan *Result {
-	if _, ok := sc.notify[logIndex]; !ok {
-		sc.notify[logIndex] = make(chan *Result, 1)
+func (sc *ShardCtrler) getNotify(index int) chan *Result {
+	if _, ok := sc.notify[index]; !ok {
+		sc.notify[index] = make(chan *Result, 1)
 	}
-	return sc.notify[logIndex]
+	return sc.notify[index]
 }
 
 func (sc *ShardCtrler) purpose(op *Op) (res interface{}, err Err) {
-	// log.Printf("ShardCtrler-%d [PURPOSE] %v\n", sc.me, *op)
-
-	sc.mu.RLock()
-	if sc.isDup(op.ClientId, op.Seq) {
-		lastResult := sc.last[op.ClientId].Result
-		defer sc.mu.RUnlock()
-		return lastResult.Value, lastResult.Err
-	}
-	sc.mu.RUnlock()
-
 	logIndex, _, leader := sc.rf.Start(*op)
 	if !leader {
 		return "", ErrWrongLeader
 	}
+
+	// log.Printf("ShardCtrler-%d [purpose] %v\n", sc.me, *op)
 
 	sc.mu.Lock()
 	notify := sc.getNotify(logIndex)
@@ -118,33 +118,54 @@ func (sc *ShardCtrler) purpose(op *Op) (res interface{}, err Err) {
 
 // Add new groups
 func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
-	// Your code here.
+	sc.mu.RLock()
+	if sc.isDup(args.ClientId, args.Seq) {
+		reply.Err = sc.last[args.ClientId].Result.Err
+		sc.mu.RUnlock()
+		return
+	}
+	sc.mu.RUnlock()
+
 	_, reply.Err = sc.purpose(&Op{
 		ClientId: args.ClientId,
 		Seq:      args.Seq,
-		Op:       "Join",
+		Op:       OpJoin,
 		Replicas: args.Servers,
 	})
 }
 
 // Destroy groups
 func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
-	// Your code here.
+	sc.mu.RLock()
+	if sc.isDup(args.ClientId, args.Seq) {
+		reply.Err = sc.last[args.ClientId].Result.Err
+		sc.mu.RUnlock()
+		return
+	}
+	sc.mu.RUnlock()
+
 	_, reply.Err = sc.purpose(&Op{
 		ClientId: args.ClientId,
 		Seq:      args.Seq,
-		Op:       "Leave",
+		Op:       OpLeave,
 		GIDs:     args.GIDs,
 	})
 }
 
 // Move shards from one group to another
 func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
-	// Your code here.
+	sc.mu.RLock()
+	if sc.isDup(args.ClientId, args.Seq) {
+		reply.Err = sc.last[args.ClientId].Result.Err
+		sc.mu.RUnlock()
+		return
+	}
+	sc.mu.RUnlock()
+
 	_, reply.Err = sc.purpose(&Op{
 		ClientId: args.ClientId,
 		Seq:      args.Seq,
-		Op:       "Move",
+		Op:       OpMove,
 		Shard:    args.Shard,
 		GID:      args.GID,
 	})
@@ -152,11 +173,10 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 
 // Query the configuration
 func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
-	// Your code here.
 	res, err := sc.purpose(&Op{
 		ClientId: args.ClientId,
 		Seq:      args.Seq,
-		Op:       "Query",
+		Op:       OpQuery,
 		Num:      args.Num,
 	})
 	reply.Err = err
@@ -244,16 +264,33 @@ func findGIDWithMaxShards(g2s map[int][]int) int {
 	return index
 }
 
-func (sc *ShardCtrler) execute(op *Op) *Result {
-	res := &Result{Err: OK}
+func (sc *ShardCtrler) execute(op *Op) (result *Result) {
+	result = &Result{Err: OK}
+
+	if op.Op != OpQuery {
+		if sc.isDup(op.ClientId, op.Seq) {
+			return sc.last[op.ClientId].Result
+		}
+		defer func() {
+			sc.last[op.ClientId] = &Last{Seq: op.Seq, Result: result}
+		}()
+	}
+
 	switch op.Op {
-	case "Join":
+	case OpQuery:
+		if op.Num < 0 {
+			op.Num = len(sc.configs) + op.Num
+		}
+		if op.Num > len(sc.configs)-1 {
+			op.Num = len(sc.configs) - 1
+		}
+		result.Value = sc.configs[op.Num]
+
+	case OpJoin:
 		last := sc.configs[len(sc.configs)-1]
 		newConfig := Config{
-			Num: len(sc.configs),
-			// shard -> gid
+			Num:    len(sc.configs),
 			Shards: last.Shards,
-			// gid -> servers mappings
 			Groups: deepCopy(last.Groups),
 		}
 
@@ -284,13 +321,11 @@ func (sc *ShardCtrler) execute(op *Op) *Result {
 
 		sc.configs = append(sc.configs, newConfig)
 
-	case "Leave":
+	case OpLeave:
 		last := sc.configs[len(sc.configs)-1]
 		newConfig := Config{
-			Num: len(sc.configs),
-			// shard -> gid
+			Num:    len(sc.configs),
 			Shards: last.Shards,
-			// gid -> servers mappings
 			Groups: deepCopy(last.Groups),
 		}
 
@@ -329,52 +364,49 @@ func (sc *ShardCtrler) execute(op *Op) *Result {
 
 		sc.configs = append(sc.configs, newConfig)
 
-	case "Move":
+	case OpMove:
 		last := sc.configs[len(sc.configs)-1]
 		newConfig := Config{
 			Num: len(sc.configs),
-			// shard -> gid
+			// [shard]gid
 			Shards: last.Shards,
-			// gid -> servers mappings
+			// map[gid][]servers
 			Groups: deepCopy(last.Groups),
 		}
 
 		newConfig.Shards[op.Shard] = op.GID
 		sc.configs = append(sc.configs, newConfig)
 
-	case "Query":
-		if op.Num < 0 {
-			op.Num = len(sc.configs) + op.Num
-		}
-		if op.Num > len(sc.configs)-1 {
-			op.Num = len(sc.configs) - 1
-		}
-		res.Value = sc.configs[op.Num]
 	}
-	return res
+	return result
 }
 
-func (sc *ShardCtrler) applier() {
-	for msg := range sc.applyCh {
-		if sc.killed() {
-			break
-		}
+func (sc *ShardCtrler) executor() {
+	for !sc.killed() {
+		msg := <-sc.applyCh
+		assert(msg.CommandValid, "invalid command")
+
+		op := msg.Command.(Op)
 		sc.mu.Lock()
 
-		if msg.CommandValid {
-			op := msg.Command.(Op)
-			if !sc.isDup(op.ClientId, op.Seq) {
-				result := sc.execute(&op)
-				sc.last[op.ClientId] = &Last{Seq: op.Seq, Result: result}
-			}
-
-			// only notify related channel for currentTerm's log when node is leader
-			currentTerm, isLeader := sc.rf.GetState()
-			if isLeader && msg.CommandTerm == currentTerm {
-				ch := sc.getNotify(msg.CommandIndex)
-				ch <- sc.last[op.ClientId].Result
-			}
+		// skip if the log applied is already executed
+		if msg.CommandIndex <= sc.lastExecuted {
+			sc.mu.Unlock()
+			continue
 		}
+		assert(msg.CommandIndex == sc.lastExecuted+1 || sc.lastExecuted == 0, "unexpected command index")
+		sc.lastExecuted = msg.CommandIndex
+
+		result := sc.execute(&op)
+
+		// only notify related channel for currentTerm's log when node is leader
+		currentTerm, isLeader := sc.rf.GetState()
+		if isLeader && msg.CommandTerm == currentTerm {
+			ch := sc.getNotify(msg.CommandIndex)
+			ch <- result
+		}
+
+		// log.Printf("ShardCtrler-%d [execute] %v -> %v\n", sc.me, op, *result)
 
 		sc.mu.Unlock()
 	}
@@ -398,7 +430,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	// Your code here.
 	sc.last = make(map[int64]*Last)
 	sc.notify = make(map[int]chan *Result)
-	go sc.applier()
+	sc.lastExecuted = 0
+
+	go sc.executor()
 
 	return sc
 }

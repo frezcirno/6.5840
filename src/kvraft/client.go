@@ -52,19 +52,15 @@ func (ck *Clerk) Get(key string) string {
 	seq := ck.NextSeq()
 	args := GetArgs{Key: key, ClientId: ck.me, Seq: seq}
 	for {
-		lastLeader := ck.leader
-		for i := range ck.servers {
-			server := ck.servers[(lastLeader+i)%len(ck.servers)]
-			reply := GetReply{}
-			if server.Call("KVServer.Get", &args, &reply) {
-				if reply.Err == OK {
-					ck.leader = (lastLeader + i) % len(ck.servers)
-					return reply.Value
-				}
-			}
+		var reply GetReply
+		ok := ck.servers[ck.leader].Call("KVServer.Get", &args, &reply)
+		if !ok || reply.Err == ErrWrongLeader || reply.Err == ErrTimeout {
+			ck.leader = (ck.leader + 1) % len(ck.servers)
+		} else if reply.Err == OK {
+			return reply.Value
 		}
-		// log.Println("Get", seq, "failed, retrying")
-		time.Sleep(100 * time.Millisecond)
+
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -80,19 +76,15 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	seq := ck.NextSeq()
 	args := PutAppendArgs{Key: key, Value: value, ClientId: ck.me, Seq: seq}
 	for {
-		lastLeader := ck.leader
-		for i := range ck.servers {
-			server := ck.servers[(lastLeader+i)%len(ck.servers)]
-			reply := PutAppendReply{}
-			if server.Call("KVServer."+op, &args, &reply) {
-				if reply.Err == OK {
-					ck.leader = (lastLeader + i) % len(ck.servers)
-					return
-				}
-			}
+		var reply PutAppendReply
+		ok := ck.servers[ck.leader].Call("KVServer."+op, &args, &reply)
+		if !ok || reply.Err == ErrWrongLeader || reply.Err == ErrTimeout {
+			ck.leader = (ck.leader + 1) % len(ck.servers)
+		} else if reply.Err == OK {
+			return
 		}
-		// log.Println("PutAppend", seq, "failed, retrying")
-		time.Sleep(100 * time.Millisecond)
+
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

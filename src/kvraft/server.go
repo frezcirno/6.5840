@@ -15,18 +15,19 @@ import (
 const Debug = false
 const ExecuteTimeout = 500 * time.Millisecond
 
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug {
-		log.Printf(format, a...)
-	}
-	return
-}
-
 func assert(cond bool, msg string) {
 	if !cond {
-		log.Panicln(msg)
+		panic(msg)
 	}
 }
+
+type OpType uint8
+
+const (
+	OpGet OpType = iota
+	OpPut
+	OpAppend
+)
 
 type Op struct {
 	// Your definitions here.
@@ -34,7 +35,7 @@ type Op struct {
 	// otherwise RPC will break.
 	ClientId int64
 	Seq      int64
-	Op       string
+	Op       OpType
 	Key      string
 	Value    string
 }
@@ -60,8 +61,15 @@ type KVServer struct {
 
 	// Your definitions here.
 	store  map[string]string
-	last   map[int64]*Last
+	last   map[int64]Last
 	notify map[int]chan *Result
+
+	persister *raft.Persister
+
+	// As the underlying raft implementation may apply snapshot asynchronously,
+	// we need to keep track of the last applied log index to avoid re-applying
+	// the same log after a snapshot is applied.
+	lastExecuted int
 }
 
 func (kv *KVServer) isDup(clientId, seq int64) bool {
@@ -73,29 +81,21 @@ func (kv *KVServer) isDup(clientId, seq int64) bool {
 	return seq == last.Seq
 }
 
-func (kv *KVServer) getNotify(logIndex int) chan *Result {
-	if _, ok := kv.notify[logIndex]; !ok {
-		kv.notify[logIndex] = make(chan *Result, 1)
+func (kv *KVServer) getNotify(index int) chan *Result {
+	if _, ok := kv.notify[index]; !ok {
+		kv.notify[index] = make(chan *Result, 1)
 	}
-	return kv.notify[logIndex]
+	return kv.notify[index]
 }
 
 func (kv *KVServer) purpose(op *Op) (value string, err Err) {
-	kv.mu.RLock()
-	if kv.isDup(op.ClientId, op.Seq) {
-		lastResult := kv.last[op.ClientId].Result
-		value = lastResult.Value
-		err = lastResult.Err
-		kv.mu.RUnlock()
-		return
-	}
-	kv.mu.RUnlock()
-
 	logIndex, _, leader := kv.rf.Start(*op)
 	if !leader {
 		err = ErrWrongLeader
 		return
 	}
+
+	// log.Printf("[kvraft-%d] [start] %d {%d %d %v %s %s}", kv.me, logIndex, op.ClientId, op.Seq, op.Op, op.Key, op.Value)
 
 	kv.mu.Lock()
 	notify := kv.getNotify(logIndex)
@@ -124,27 +124,43 @@ func (kv *KVServer) purpose(op *Op) (value string, err Err) {
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	reply.Value, reply.Err = kv.purpose(&Op{
 		Key:      args.Key,
-		Op:       "Get",
+		Op:       OpGet,
 		ClientId: args.ClientId,
 		Seq:      args.Seq,
 	})
 }
 
 func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
+	kv.mu.RLock()
+	if kv.isDup(args.ClientId, args.Seq) {
+		reply.Err = kv.last[args.ClientId].Result.Err
+		kv.mu.RUnlock()
+		return
+	}
+	kv.mu.RUnlock()
+
 	_, reply.Err = kv.purpose(&Op{
 		Key:      args.Key,
 		Value:    args.Value,
-		Op:       "Put",
+		Op:       OpPut,
 		ClientId: args.ClientId,
 		Seq:      args.Seq,
 	})
 }
 
 func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
+	kv.mu.RLock()
+	if kv.isDup(args.ClientId, args.Seq) {
+		reply.Err = kv.last[args.ClientId].Result.Err
+		kv.mu.RUnlock()
+		return
+	}
+	kv.mu.RUnlock()
+
 	_, reply.Err = kv.purpose(&Op{
 		Key:      args.Key,
 		Value:    args.Value,
-		Op:       "Append",
+		Op:       OpAppend,
 		ClientId: args.ClientId,
 		Seq:      args.Seq,
 	})
@@ -169,29 +185,44 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
-func (kv *KVServer) execute(op Op) *Result {
-	var result Result
+func (kv *KVServer) execute(op *Op) *Result {
+	result := &Result{}
 	switch op.Op {
-	case "Get":
+	case OpGet:
 		result.Value = kv.store[op.Key]
 		result.Err = OK
-	case "Put":
+	case OpPut:
+		if kv.isDup(op.ClientId, op.Seq) {
+			return kv.last[op.ClientId].Result
+		}
+
 		kv.store[op.Key] = op.Value
 		result.Err = OK
-	case "Append":
+
+		kv.last[op.ClientId] = Last{Seq: op.Seq, Result: result}
+	case OpAppend:
+		if kv.isDup(op.ClientId, op.Seq) {
+			return kv.last[op.ClientId].Result
+		}
+
 		kv.store[op.Key] += op.Value
 		result.Err = OK
+
+		kv.last[op.ClientId] = Last{Seq: op.Seq, Result: result}
 	default:
 		panic("Unknown Operation")
 	}
-	return &result
+	// log.Printf("[kvraft-%d] [execute] {%d %d %v %s %s}", kv.me, op.ClientId, op.Seq, op.Op, op.Key, op.Value)
+	return result
 }
 
 func (kv *KVServer) makeSnapshot() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
-	e.Encode(kv.store)
-	e.Encode(kv.last)
+	if e.Encode(kv.store) != nil ||
+		e.Encode(kv.last) != nil {
+		log.Panicln("Encode failed")
+	}
 	return w.Bytes()
 }
 
@@ -201,44 +232,62 @@ func (kv *KVServer) restoreSnapshot(snapshot []byte) {
 	}
 	r := bytes.NewBuffer(snapshot)
 	d := labgob.NewDecoder(r)
-	if d.Decode(&kv.store) != nil ||
-		d.Decode(&kv.last) != nil {
-		log.Panicln("restoreSnapshot failed")
+	var store map[string]string
+	var last map[int64]Last
+	if d.Decode(&store) != nil ||
+		d.Decode(&last) != nil {
+		log.Panicln("Decode failed")
 	}
+	kv.store = store
+	kv.last = last
 }
 
-func (kv *KVServer) applier() {
-	for msg := range kv.applyCh {
-		if kv.killed() {
-			break
-		}
-
+func (kv *KVServer) executor() {
+	for !kv.killed() {
+		msg := <-kv.applyCh
 		assert(msg.CommandValid || msg.SnapshotValid, "invalid message")
-		kv.mu.Lock()
 
 		if msg.CommandValid {
 			op := msg.Command.(Op)
-			if !kv.isDup(op.ClientId, op.Seq) {
-				result := kv.execute(op)
-				kv.last[op.ClientId] = &Last{Seq: op.Seq, Result: result}
+			kv.mu.Lock()
+
+			// skip if the log applied is already executed
+			if msg.CommandIndex <= kv.lastExecuted {
+				kv.mu.Unlock()
+				continue
 			}
+			assert(msg.CommandIndex == kv.lastExecuted+1 || kv.lastExecuted == 0, "unexpected command index")
+			kv.lastExecuted = msg.CommandIndex
+
+			result := kv.execute(&op)
 
 			// only notify related channel for currentTerm's log when node is leader
 			currentTerm, isLeader := kv.rf.GetState()
 			if isLeader && msg.CommandTerm == currentTerm {
 				ch := kv.getNotify(msg.CommandIndex)
-				ch <- kv.last[op.ClientId].Result
+				ch <- result
 			}
 
 			// snapshot if log grows too big
-			if kv.maxraftstate != -1 && kv.rf.RaftStateSize() >= kv.maxraftstate {
-				kv.rf.Snapshot(msg.CommandIndex, kv.makeSnapshot())
+			if kv.maxraftstate != -1 && kv.persister.RaftStateSize() >= kv.maxraftstate {
+				snapshot := kv.makeSnapshot()
+				kv.mu.Unlock()
+				// async submit snapshot to raft
+				go func(commandIndex int) {
+					kv.rf.Snapshot(commandIndex, snapshot)
+				}(msg.CommandIndex)
+				continue
 			}
+			kv.mu.Unlock()
 		} else {
-			kv.restoreSnapshot(msg.Snapshot)
+			kv.mu.Lock()
+			if kv.rf.TryInstallSnapshot(msg.SnapshotTerm, msg.SnapshotIndex, msg.Snapshot) {
+				kv.restoreSnapshot(msg.Snapshot)
+				kv.lastExecuted = msg.SnapshotIndex
+			}
+			kv.mu.Unlock()
 		}
 
-		kv.mu.Unlock()
 	}
 }
 
@@ -265,16 +314,19 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	kv.store = make(map[string]string)
-	kv.last = make(map[int64]*Last)
+	kv.last = make(map[int64]Last)
 	kv.notify = make(map[int]chan *Result)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.persister = persister
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+
+	kv.lastExecuted = 0
 
 	kv.restoreSnapshot(persister.ReadSnapshot())
 
 	// You may need initialization code here.
-	go kv.applier()
+	go kv.executor()
 
 	return kv
 }

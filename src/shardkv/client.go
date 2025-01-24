@@ -94,7 +94,7 @@ func (ck *Clerk) Get(key string) string {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers := ck.config.Groups[gid]; len(servers) > 0 {
-			for {
+			for range servers { // try `len(servers)` times max
 				var reply GetReply
 				ok := ck.make_end(servers[ck.leader[gid]]).Call("ShardKV.Get", &args, &reply)
 				if !ok || reply.Err == ErrWrongLeader || reply.Err == ErrTimeout || reply.Err == ErrBusy {
@@ -127,7 +127,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers := ck.config.Groups[gid]; len(servers) > 0 {
-			for {
+			for range servers { // try `len(servers)` times max
 				var reply PutAppendReply
 				ok := ck.make_end(servers[ck.leader[gid]]).Call("ShardKV.PutAppend", &args, &reply)
 				if !ok || reply.Err == ErrWrongLeader || reply.Err == ErrBusy || reply.Err == ErrTimeout {

@@ -198,6 +198,12 @@ type Raft struct {
 	nextIndex  []int
 	matchIndex []int
 
+	applying int32
+	// If true, use asynchronous InstallSnapshot
+	// Asynchronous InstallSnapshot is faster but cannot pass lab 3D test
+	// Lab 3D test requires the service to switch to the snapshot immediately
+	useAsyncInstallSnapshot bool
+
 	tag string // for debug
 }
 
@@ -363,11 +369,11 @@ type InstallSnapshotReply struct {
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
 	// outdated leader
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
+		rf.mu.Unlock()
 		return
 	}
 
@@ -382,26 +388,47 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	// outdated snapshot
 	if args.LastIncludedIndex <= rf.prevLogIndex() || args.LastIncludedIndex <= rf.commitIndex {
+		rf.mu.Unlock()
 		return
 	}
 	assert_gt(args.LastIncludedIndex, rf.prevLogIndex(), "old snapshot")
 	assert_gt(args.LastIncludedIndex, rf.commitIndex, "outdated snapshot")
 
-	go func() {
-		// Notify the service that we are going to switch to a snapshot.
-		// When the service is ready, it should call `TryInstallSnapshot`
-		// and switch to the snapshot.
+	if !rf.useAsyncInstallSnapshot {
+		rf.doInstallSnapshot(args.LastIncludedTerm, args.LastIncludedIndex, args.Data)
+		for atomic.LoadInt32(&rf.applying) > 0 {
+			// wait for old logs to be applied
+			time.Sleep(1 * time.Millisecond)
+		}
 		rf.applyCh <- ApplyMsg{
 			SnapshotValid: true,
 			Snapshot:      args.Data,
 			SnapshotTerm:  args.LastIncludedTerm,
 			SnapshotIndex: args.LastIncludedIndex,
 		}
-	}()
+		rf.mu.Unlock()
+	} else {
+		rf.mu.Unlock()
+		go func() {
+			// Notify the service that we are going to switch to a snapshot.
+			// When the service is ready, it should call `TryInstallSnapshot`
+			// and switch to the snapshot.
+			rf.applyCh <- ApplyMsg{
+				SnapshotValid: true,
+				Snapshot:      args.Data,
+				SnapshotTerm:  args.LastIncludedTerm,
+				SnapshotIndex: args.LastIncludedIndex,
+			}
+		}()
+	}
 }
 
 // Try to switch to the snapshot, return true if successful
 func (rf *Raft) TryInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
+	if !rf.useAsyncInstallSnapshot {
+		return true
+	}
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -410,6 +437,10 @@ func (rf *Raft) TryInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, 
 		return false
 	}
 
+	return rf.doInstallSnapshot(lastIncludedTerm, lastIncludedIndex, snapshot)
+}
+
+func (rf *Raft) doInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 	// truncate logs
 	dummy := []LogEntry{{Term: lastIncludedTerm, Command: lastIncludedIndex}}
 	rf.log = append(dummy, rf.getLogFrom(lastIncludedIndex+1)...)
@@ -975,6 +1006,7 @@ func (rf *Raft) applier() {
 			entries := append([]LogEntry{}, rf.getLogSlice(startIndex, rf.commitIndex+1)...)
 			rf_commitIndex := rf.commitIndex
 			rf.mu.Unlock()
+			atomic.StoreInt32(&rf.applying, 1)
 			for i, entry := range entries {
 				rf.applyCh <- ApplyMsg{
 					CommandValid: true,
@@ -983,6 +1015,7 @@ func (rf *Raft) applier() {
 					CommandIndex: startIndex + i,
 				}
 			}
+			atomic.StoreInt32(&rf.applying, 0)
 			rf.mu.Lock()
 			rf.lastApplied = Max(rf.lastApplied, rf_commitIndex)
 		} else {
@@ -994,6 +1027,10 @@ func (rf *Raft) applier() {
 
 func (rf *Raft) SetTag(tag string) {
 	rf.tag = tag
+}
+
+func (rf *Raft) SetAsyncInstallSnapshot(enable bool) {
+	rf.useAsyncInstallSnapshot = enable
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -1033,6 +1070,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
+
+	rf.applying = 0
+	rf.useAsyncInstallSnapshot = false
 	rf.tag = ""
 
 	// initialize from state persisted before a crash

@@ -426,6 +426,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	labgob.Register(Op{})
 	sc.applyCh = make(chan raft.ApplyMsg)
 	sc.rf = raft.Make(servers, me, persister, sc.applyCh)
+	sc.rf.SetAsyncInstallSnapshot(true)
 
 	// Your code here.
 	sc.last = make(map[int64]*Last)

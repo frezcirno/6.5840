@@ -256,7 +256,6 @@ func (kv *KVServer) executor() {
 				kv.mu.Unlock()
 				continue
 			}
-			assert(msg.CommandIndex == kv.lastExecuted+1 || kv.lastExecuted == 0, "unexpected command index")
 			kv.lastExecuted = msg.CommandIndex
 
 			result := kv.execute(&op)
@@ -320,6 +319,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.persister = persister
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.rf.SetAsyncInstallSnapshot(true)
 
 	kv.lastExecuted = 0
 

@@ -3,7 +3,6 @@ package shardkv
 import (
 	"bytes"
 	"fmt"
-	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -132,7 +131,7 @@ func (kv *ShardKV) purpose(op *Op) (value string, err Err) {
 		return "", ErrWrongLeader
 	}
 
-	log.Printf("ShardKV-%d%d [purpose] %v\n", kv.gid, kv.me, *op)
+	// log.Printf("ShardKV-%d%d [purpose] %v\n", kv.gid, kv.me, *op)
 
 	kv.mu.Lock()
 	notify := kv.getNotify(logIndex)
@@ -473,7 +472,7 @@ func (kv *ShardKV) execute(op *Op) *Result {
 	default:
 		panic("Unknown Operation")
 	}
-	log.Printf("ShardKV-%d%d [execute] %v, op: %v\n", kv.gid, kv.me, result.Err, *op)
+	// log.Printf("ShardKV-%d%d [execute] %v, op: %v\n", kv.gid, kv.me, result.Err, *op)
 	return result
 }
 
@@ -483,7 +482,7 @@ func (kv *ShardKV) makeSnapshot() []byte {
 	if e.Encode(&kv.shards) != nil ||
 		e.Encode(&kv.last) != nil ||
 		e.Encode(&kv.cfg) != nil {
-		log.Panicln("Encode failed")
+		panic("Encode failed")
 	}
 	return w.Bytes()
 }
@@ -501,7 +500,7 @@ func (kv *ShardKV) restoreSnapshot(snapshot []byte) {
 	if d.Decode(&shard_store) != nil ||
 		d.Decode(&last) != nil ||
 		d.Decode(&cfg) != nil {
-		log.Panicln("Decode failed")
+		panic("Decode failed")
 	}
 	kv.shards = shard_store
 	kv.last = last
@@ -615,7 +614,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	}
 
 	kv.restoreSnapshot(persister.ReadSnapshot())
-	log.Printf("ShardKV-%d%d [init] %v\n", kv.gid, kv.me, kv.cfg)
+	// log.Printf("ShardKV-%d%d [init] %v\n", kv.gid, kv.me, kv.cfg)
 
 	go kv.configListener()
 	go kv.shardTransmitter()

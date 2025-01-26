@@ -168,7 +168,7 @@ type LogEntry struct {
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	mu        sync.RWMutex        // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -615,9 +615,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	assert_eq(args.Term, rf.currentTerm, "term mismatch")
 	assert(!rf.leader, "leader should not receive AppendEntries")
 	rf.electionTimer.Reset(makeElectionTimeout())
-	if len(args.Entries) > 0 {
-		// log.Printf("raft-%s%d [ping] from leader term %d, with log[%d:%d], my log[%d:%d], commitIndex: %d, lastApplied: %d", rf.tag, rf.me, args.Term, args.PrevLogIndex+1, args.PrevLogIndex+1+len(args.Entries), rf.firstLogIndex(), rf.nextLogIndex(), rf.commitIndex, rf.lastApplied)
-	}
+	// if len(args.Entries) > 0 {
+	// log.Printf("raft-%s%d [ping] from leader term %d, with log[%d:%d], my log[%d:%d], commitIndex: %d, lastApplied: %d", rf.tag, rf.me, args.Term, args.PrevLogIndex+1, args.PrevLogIndex+1+len(args.Entries), rf.firstLogIndex(), rf.nextLogIndex(), rf.commitIndex, rf.lastApplied)
+	// }
 	reply.Term = rf.currentTerm
 
 	// conflict because we don't have the prev log entry
@@ -706,12 +706,12 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // if it's ever committed. the second return value is the current
 // term. the third return value is true if this server believes it is
 // the leader.
-func (rf *Raft) Start(command interface{}) (int, int, bool) {
+func (rf *Raft) Start(command interface{}) (lastLogIndex int, currentTerm int, isLeader bool) {
 	// Your code here (3B).
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
 	if !rf.leader {
+		rf.mu.Unlock()
 		return -1, -1, false
 	}
 	rf.log = append(rf.log, LogEntry{
@@ -720,9 +720,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	})
 	assert_le(rf.commitIndex, rf.lastLogIndex(), "commitIndex > lastLogIndex")
 	rf.persist()
+
 	// log.Printf("raft-%s%d [start] log[%d]", rf.tag, rf.me, rf.lastLogIndex())
+	lastLogIndex, currentTerm = rf.lastLogIndex(), rf.currentTerm
+	rf.mu.Unlock()
+
+	isLeader = true
 	rf.doReplicate(false)
-	return rf.lastLogIndex(), rf.currentTerm, true
+	return
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -835,8 +840,8 @@ func (rf *Raft) ticker() {
 }
 
 func (rf *Raft) needReplicateTo(i int) bool {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.mu.RLock()
+	defer rf.mu.RUnlock()
 	return rf.leader && rf.matchIndex[i] < rf.lastLogIndex()
 }
 
@@ -964,9 +969,10 @@ func (rf *Raft) replicateByAE(i int, args *AppendEntriesArgs, nextIndex int) {
 }
 
 func (rf *Raft) replicateTo(i int) {
-	rf.mu.Lock()
+	// Use read lock to avoid blocking other replicators
+	rf.mu.RLock()
 	if !rf.leader {
-		rf.mu.Unlock()
+		rf.mu.RUnlock()
 		return
 	}
 
@@ -980,7 +986,7 @@ func (rf *Raft) replicateTo(i int) {
 			LastIncludedTerm:  rf.prevLogTerm(),
 			Data:              rf.persister.ReadSnapshot(),
 		}
-		rf.mu.Unlock()
+		rf.mu.RUnlock()
 		// log.Printf("raft-%s%d [replicate snapshot] to %d with log[:%d], whose nextIndex %d", rf.tag, rf.me, i, args.LastIncludedIndex+1, nextIndex)
 		rf.replicateByIS(i, args)
 	} else {
@@ -997,7 +1003,7 @@ func (rf *Raft) replicateTo(i int) {
 			Entries:      logs_copy, // not include the dummy log
 			LeaderCommit: rf.commitIndex,
 		}
-		rf.mu.Unlock()
+		rf.mu.RUnlock()
 		// if len(args.Entries) > 0 {
 		// log.Printf("raft-%s%d [replicate logs] to %d with log[%d:%d], whose nextIndex %d", rf.tag, rf.me, i, args.PrevLogIndex+1, args.PrevLogIndex+1+len(args.Entries), nextIndex)
 		// }

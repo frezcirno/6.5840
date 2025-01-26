@@ -292,7 +292,6 @@ func (rf *Raft) beFollower(term int) {
 	rf.currentTerm = term
 	rf.votedFor = -1
 	rf.switchLeader(false)
-	rf.persist()
 }
 
 // return currentTerm and whether this server
@@ -380,6 +379,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	// we are outdated, become follower
 	if args.Term > rf.currentTerm {
 		rf.beFollower(args.Term)
+		rf.persist()
 	}
 	assert_eq(args.Term, rf.currentTerm, "term mismatch")
 	assert(!rf.leader, "leader should not receive InstallSnapshot")
@@ -520,15 +520,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 
 	// outdated client
-	if args.Term < rf.currentTerm {
+	if args.Term <= rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		return
 	}
 
 	// we are outdated, become follower
+	persist := false
 	if args.Term > rf.currentTerm {
 		rf.beFollower(args.Term)
+		persist = true
 	}
 
 	assert_eq(args.Term, rf.currentTerm, "term mismatch")
@@ -540,11 +542,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && rf.isPeerUpToDate(args) {
 		// log.Printf("raft-%s%d [vote] %d for term %d", rf.tag, rf.me, args.CandidateId, rf.currentTerm)
 		rf.votedFor = args.CandidateId
-		rf.persist()
 		rf.electionTimer.Reset(makeElectionTimeout())
 		reply.VoteGranted = true
-	} else {
-		reply.VoteGranted = false
+		persist = true
+	}
+	if persist {
+		rf.persist()
 	}
 }
 
@@ -608,8 +611,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// we are outdated, become follower
+	persist := false
 	if args.Term > rf.currentTerm {
 		rf.beFollower(args.Term)
+		persist = true
 	}
 
 	assert_eq(args.Term, rf.currentTerm, "term mismatch")
@@ -628,6 +633,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// give us later log index
 		reply.ConflictTerm = -1
 		reply.ConflictIndex = rf.nextLogIndex()
+		if persist {
+			rf.persist()
+		}
 		return
 	}
 	assert(args.PrevLogIndex >= rf.prevLogIndex(), "args.PrevLogIndex < rf.prevLogIndex")
@@ -639,6 +647,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		reply.ConflictTerm = -1
 		reply.ConflictIndex = rf.nextLogIndex()
+		if persist {
+			rf.persist()
+		}
 		return
 	}
 
@@ -658,6 +669,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				break
 			}
 		}
+		if persist {
+			rf.persist()
+		}
 		return
 	}
 
@@ -674,7 +688,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			// found conflict, truncate logs
 			log := rf.log[:index-rf.prevLogIndex()]
 			rf.log = append(log, args.Entries[i:]...)
-			rf.persist()
+			persist = true
 			break
 		}
 	}
@@ -687,6 +701,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.applyCond.Signal()
 	}
 	assert_le(rf.commitIndex, rf.lastLogIndex(), "commitIndex > lastLogIndex")
+	if persist {
+		rf.persist()
+	}
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -706,7 +723,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // if it's ever committed. the second return value is the current
 // term. the third return value is true if this server believes it is
 // the leader.
-func (rf *Raft) Start(command interface{}) (lastLogIndex int, currentTerm int, isLeader bool) {
+func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (3B).
 	rf.mu.Lock()
 
@@ -722,12 +739,11 @@ func (rf *Raft) Start(command interface{}) (lastLogIndex int, currentTerm int, i
 	rf.persist()
 
 	// log.Printf("raft-%s%d [start] log[%d]", rf.tag, rf.me, rf.lastLogIndex())
-	lastLogIndex, currentTerm = rf.lastLogIndex(), rf.currentTerm
+	lastLogIndex, currentTerm := rf.lastLogIndex(), rf.currentTerm
 	rf.mu.Unlock()
 
-	isLeader = true
 	rf.doReplicate(false)
-	return
+	return lastLogIndex, currentTerm, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -751,14 +767,14 @@ func (rf *Raft) killed() bool {
 
 func (rf *Raft) doElection() {
 	// no leader heartbeats received
-	var args RequestVoteArgs
+	var args *RequestVoteArgs
 	{
 		rf.mu.Lock()
 
 		rf.currentTerm++
 		rf.votedFor = rf.me
 		rf.persist()
-		args = RequestVoteArgs{
+		args = &RequestVoteArgs{
 			Term:         rf.currentTerm,
 			CandidateId:  rf.me,
 			LastLogIndex: rf.lastLogIndex(),
@@ -778,14 +794,13 @@ func (rf *Raft) doElection() {
 		}
 		go func(i int) {
 			reply := RequestVoteReply{}
-			if !rf.sendRequestVote(i, &args, &reply) {
+			if !rf.sendRequestVote(i, args, &reply) {
 				// failed to send request
 				return
 			}
 
 			if reply.VoteGranted {
 				votes := int(votes.Add(1))
-
 				rf.mu.Lock()
 				// check if we have majority votes
 				// and we are still in the same term
@@ -803,6 +818,7 @@ func (rf *Raft) doElection() {
 				rf.mu.Lock()
 				if reply.Term > rf.currentTerm {
 					rf.beFollower(reply.Term)
+					rf.persist()
 				}
 				rf.mu.Unlock()
 			}
@@ -863,6 +879,7 @@ func (rf *Raft) replicateByIS(i int, args *InstallSnapshotArgs) {
 	// we are outdated
 	if reply.Term > rf.currentTerm {
 		rf.beFollower(reply.Term)
+		rf.persist()
 		return
 	}
 
@@ -901,7 +918,7 @@ func (rf *Raft) updateCommitIndex() {
 	}
 }
 
-func (rf *Raft) replicateByAE(i int, args *AppendEntriesArgs, nextIndex int) {
+func (rf *Raft) replicateByAE(i int, args *AppendEntriesArgs) {
 	reply := &AppendEntriesReply{}
 	if !rf.sendAppendEntries(i, args, reply) {
 		// net failure
@@ -935,6 +952,7 @@ func (rf *Raft) replicateByAE(i int, args *AppendEntriesArgs, nextIndex int) {
 		// we are outdated
 		if reply.Term > rf.currentTerm {
 			rf.beFollower(reply.Term)
+			rf.persist()
 			return
 		}
 
@@ -978,7 +996,6 @@ func (rf *Raft) replicateTo(i int) {
 
 	nextIndex := rf.nextIndex[i]
 	if nextIndex <= rf.prevLogIndex() {
-		assert_gt(len(rf.persister.ReadSnapshot()), 0, "snapshot is empty")
 		args := &InstallSnapshotArgs{
 			Term:              rf.currentTerm,
 			LeaderId:          rf.me,
@@ -1007,7 +1024,7 @@ func (rf *Raft) replicateTo(i int) {
 		// if len(args.Entries) > 0 {
 		// log.Printf("raft-%s%d [replicate logs] to %d with log[%d:%d], whose nextIndex %d", rf.tag, rf.me, i, args.PrevLogIndex+1, args.PrevLogIndex+1+len(args.Entries), nextIndex)
 		// }
-		rf.replicateByAE(i, args, nextIndex)
+		rf.replicateByAE(i, args)
 	}
 }
 
